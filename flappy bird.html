@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Flappy Bird — 2013 Pixel Replica</title>
+  <style>
+    /* =========================================================================
+       CSS LAYOUT & PIXEL-PERFECT VIEWPORT SCALING
+       We lock the viewport to 100% height/width with no scrolling and force
+       crisp nearest-neighbor upscaling so our 288x512 virtual canvas stays razor-sharp.
+       ========================================================================= */
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #1c1917;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      touch-action: manipulation; /* Eliminates 300ms mobile tap delay */
+    }
+
+    #game-container {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      height: 100%;
+    }
+
+    canvas {
+      display: block;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
+      /* Crisp pixel art scaling across all browsers */
+      image-rendering: -moz-crisp-edges;
+      image-rendering: -webkit-crisp-edges;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+  </div>
+
+  <script>
+    "use strict";
+
+    /**
+     * =========================================================================
+     * 1. ARCHITECTURAL CONSTANTS & EXACT 2013 FLAPPY BIRD SPECIFICATIONS
+     * =========================================================================
+     * Virtual resolution is strictly locked to 288x512 (the exact original
+     * iOS/Android asset grid). Physics values are calibrated to match the
+     * iconic heavy-gravity, snappy-impulse feel of Dong Nguyen's original.
+     */
+    const VIRTUAL_WIDTH = 288;
+    const VIRTUAL_HEIGHT = 512;
+    const GROUND_HEIGHT = 112;
+    const PLAYABLE_HEIGHT = VIRTUAL_HEIGHT - GROUND_HEIGHT; // 400px
+
+    // Kinematics (in virtual pixels / second & pixels / second^2)
+    const GRAVITY = 1520;            // Downward acceleration
+    const FLAP_IMPULSE = -405;       // Instant upward velocity on tap
+    const MAX_FALL_SPEED = 480;      // Terminal velocity cap
+    const SCROLL_SPEED = 118;        // Horizontal world scroll speed (px/sec)
+
+    // Pipe Geometry & Spawning
+    const PIPE_WIDTH = 52;
+    const PIPE_CAP_WIDTH = 56;
+    const PIPE_CAP_HEIGHT = 24;
+    const PIPE_GAP = 100;            // Vertical clearance between top & bottom pipes
+    const PIPE_SPACING = 158;        // Horizontal distance between pipe pairs
+    const PIPE_MIN_TOP = 54;         // Minimum top pipe length
+    const PIPE_MAX_TOP = PLAYABLE_HEIGHT - PIPE_GAP - 54;
+
+    // Bird Hitbox (Forgiving AABB inset inside the 34x24 sprite)
+    const BIRD_X = 76;
+    const BIRD_SPRITE_W = 34;
+    const BIRD_SPRITE_H = 24;
+    const BIRD_HITBOX_W = 24;
+    const BIRD_HITBOX_H = 18;
+
+    // Game States
+    const STATE = {
+      TITLE: 0,
+      READY: 1,
+      PLAYING: 2,
+      DYING: 3,
+      GAME_OVER: 4
+    };
+
+    // Authentic 2013 Color Palette
+    const PALETTE = {
+      SKY_DAY: "#70C5CE",
+      SKY_NIGHT: "#008793",
+      OUTLINE: "#543847",
+      SAND: "#DED895",
+      SAND_DARK: "#D0C874",
+      GRASS_LIGHT: "#9CE659",
+      GRASS_DARK: "#73BF2E",
+      PIPE_HIGHLIGHT: "#9CE659",
+      PIPE_MID: "#73BF2E",
+      PIPE_SHADOW: "#558022",
+      WHITE: "#FFFFFF",
+      RED_BADGE: "#E86101",
+      BTN_ORANGE: "#E86101",
+      BTN_CREAM: "#F8F8F0"
+    };
+
+    /**
+     * =========================================================================
+     * 2. RETRO WEB AUDIO SYNTHESIZER (ZERO EXTERNAL ASSETS)
+     * =========================================================================
+     * Synthesizes the 4 iconic Flappy Bird audio cues procedurally using Web Audio
+     * oscillators and white noise buffers—preventing 404s or load latency.
+     */
+    class SoundEngine {
+      constructor() {
+        this.ctx = null;
+        this.muted = false;
+      }
+
+      init() {
+        if (!this.ctx) {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          if (AudioCtx) this.ctx = new AudioCtx();
+        }
+        if (this.ctx && this.ctx.state === "suspended") {
+          this.ctx.resume();
+        }
+      }
+
+      // Crisp wing-flap air swoosh
+      playFlap() {
+        if (this.muted) return;
+        this.init();
+        if (!this.ctx) return;
+
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(190, now);
+        osc.frequency.exponentialRampToValueAtTime(480, now + 0.09);
+
+        gain.gain.setValueAtTime(0.18, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.095);
+      }
+
+      // Classic two-tone coin/point ding (B5 -> E6)
+      playScore() {
+        if (this.muted) return;
+        this.init();
+        if (!this.ctx) return;
+
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = "square";
+
+        // B5 (987.77 Hz) for 70ms, then E6 (1318.51 Hz)
+        osc.frequency.setValueAtTime(987.77, now);
+        osc.frequency.setValueAtTime(1318.51, now + 0.075);
+
+        gain.gain.setValueAtTime(0.11, now);
+        gain.gain.setValueAtTime(0.11, now + 0.075);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.32);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.33);
+      }
+
+      // Heavy punchy pipe/ground impact thud
+      playHit() {
+        if (this.muted) return;
+        this.init();
+        if (!this.ctx) return;
+
+        const now = this.ctx.currentTime;
+        // Low square punch
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(150, now);
+        osc.frequency.exponentialRampToValueAtTime(38, now + 0.14);
+
+        gain.gain.setValueAtTime(0.28, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.15);
+      }
+
+      // Descending whistle when falling after a mid-air pipe collision
+      playDie() {
+        if (this.muted) return;
+        this.init();
+        if (!this.ctx) return;
+
+        const now = this.ctx.currentTime + 0.12;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(420, now);
+        osc.frequency.linearRampToValueAtTime(140, now + 0.25);
+
+        gain.gain.setValueAtTime(0.14, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.26);
+      }
+
+      // UI button/screen transition swoosh
+      playSwoosh() {
+        if (this.muted) return;
+        this.init();
+        if (!this.ctx) return;
+
+        const now = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(260, now);
+        osc.frequency.exponentialRampToValueAtTime(520, now + 0.08);
+
+        gain.gain.setValueAtTime(0.1, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.085);
+      }
+    }
+
+    /**
+     * =========================================================================
+     * 3. OFFSCREEN SPRITE BAKER (PROCEDURAL PIXEL ART ENGINE)
+     * =========================================================================
+     * Why Offscreen Canvases?
+     * Drawing hundreds of individual pixel rectangles every frame at 60-144Hz
+     * creates massive CPU draw-call overhead. Instead, we bake every sprite
+     * (birds, pipes, city skyline, medals, pixel font glyphs) ONCE at boot onto
+     * offscreen <canvas> buffers. During gameplay, we blit them with fast
+     * GPU-accelerated `ctx.drawImage()` calls!
+     */
+    class SpriteAtlas {
+      constructor() {
+        this.sprites = {};
+        this.bakeAll();
+      }
+
+      createBuffer(w, h) {
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext("2d");
+        ctx.imageSmoothingEnabled = false;
+        return { canvas: c, ctx };
+      }
+
+      // Helper: Plot a 1x1 or scaled pixel grid from a string matrix
+      bakeMatrix(matrix, palette, scale = 2) {
+        const rows = matrix.length;
+        const cols = matrix[0].length;
+        const { canvas, ctx } = this.createBuffer(cols * scale, rows * scale);
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            const ch = matrix[r][c];
+            if (ch !== "." && palette[ch]) {
+              ctx.fillStyle = palette[ch];
+              ctx.fillRect(c * scale, r * scale, scale, scale);
+            }
+          }
+        }
+        return canvas;
+      }
+
+      bakeAll() {
+        this.bakeBirds();
+        this.bakeBackground();
+        this.bakeGround();
+        this.bakePipes();
+        this.bakeMedals();
+        this.bakeTapTutorial();
+      }
+
+      /**
+       * Bakes all 3 classic bird color variants (Yellow, Red, Blue)
+       * each with 3 wing frames (0: Wing Up, 1: Wing Mid, 2: Wing Down).
+       * Grid is 17x12 pixels scaled 2x -> exact 34x24 virtual sprite!
+       */
+      bakeBirds() {
+        const baseMap = [
+          "......OOOOOO.....",
+          "....OOHHHHWWOO...",
+          "...OHHHHHHWWWWOO.",
+          "..OHHHHHHHWWWBWO.",
+          ".OOHHHHHHHWWWBWOO",
+          "OYYYYYHHHHWWWWOOO",
+          "OYYYYYYYYYOOOOOOO",
+          "OYYYYYYYYYRRRRRRO",
+          ".OOYYYYYYOROOOOOO",
+          "..OOYYYYOORRRRRO.",
+          "....OOOO.OOOOOO..",
+          "................."
+        ];
+
+        // Wing overlays for the 3 animation frames
+        const wings = [
+          // Frame 0: Wing Up
+          [
+            ".................",
+            ".................",
+            ".................",
+            "..OOOOO..........",
+            ".OXXXXXOO........",
+            ".OXXXXXXO........",
+            "..OOOOOO.........",
+            ".................",
+            ".................",
+            ".................",
+            ".................",
+            "................."
+          ],
+          // Frame 1: Wing Mid
+          [
+            ".................",
+            ".................",
+            ".................",
+            ".................",
+            "..OOOOOO.........",
+            ".OXXXXXXO........",
+            ".OXXXXXXO........",
+            "..OOOOOO.........",
+            ".................",
+            ".................",
+            ".................",
+            "................."
+          ],
+          // Frame 2: Wing Down
+          [
+            ".................",
+            ".................",
+            ".................",
+            ".................",
+            ".................",
+            "..OOOOOO.........",
+            ".OXXXXXXO........",
+            ".OXXXXXOO........",
+            "..OOOOO..........",
+            ".................",
+            ".................",
+            "................."
+          ]
+        ];
+
+        const variants = {
+          yellow: {
+            O: "#543847", // Dark outline
+            H: "#FAD331", // Top highlight yellow
+            Y: "#F8B800", // Main body gold-yellow
+            X: "#FFF799", // Wing cream highlight
+            W: "#FFFFFF", // Eye white
+            B: "#543847", // Pupil
+            R: "#E86101"  // Beak orange-red
+          },
+          red: {
+            O: "#543847",
+            H: "#F87858",
+            Y: "#D82800",
+            X: "#F8B898",
+            W: "#FFFFFF",
+            B: "#543847",
+            R: "#F8B800"
+          },
+          blue: {
+            O: "#543847",
+            H: "#68C8F8",
+            Y: "#2890D8",
+            X: "#B8E8F8",
+            W: "#FFFFFF",
+            B: "#543847",
+            R: "#F8B800"
+          }
+        };
+
+        this.sprites.birds = {};
+        for (const [colorName, pal] of Object.entries(variants)) {
+          this.sprites.birds[colorName] = wings.map((wingGrid) => {
+            const combined = baseMap.map((row, r) =>
+              row.split("").map((ch, c) => (wingGrid[r][c] !== "." ? wingGrid[r][c] : ch)).join("")
+            );
+            return this.bakeMatrix(combined, pal, 2);
+          });
+        }
+      }
+
+      /**
+       * Bakes the iconic 2013 parallax backdrop:
+       * Fluffy pixel cloud bank, pastel teal city silhouettes, and bright green bushes.
+       */
+      bakeBackground() {
+        const { canvas, ctx } = this.createBuffer(VIRTUAL_WIDTH, PLAYABLE_HEIGHT);
+
+        // 1. Puffy Cloud Layer at bottom horizon
+        ctx.fillStyle = "#E4F6DF";
+        const clouds = [
+          [16, 292, 36], [48, 286, 42], [86, 294, 34], [122, 284, 46],
+          [165, 290, 38], [202, 282, 44], [244, 290, 40], [278, 295, 30]
+        ];
+        clouds.forEach(([cx, cy, r]) => {
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.fill();
+        });
+        ctx.fillRect(0, 295, VIRTUAL_WIDTH, 105);
+
+        // 2. Distant City Skyline Silhouettes
+        const buildings = [
+          { x: 4, w: 26, h: 64, win: true },
+          { x: 32, w: 22, h: 48, win: false },
+          { x: 56, w: 30, h: 76, win: true },
+          { x: 88, w: 24, h: 52, win: false },
+          { x: 118, w: 28, h: 68, win: true },
+          { x: 148, w: 20, h: 44, win: false },
+          { x: 174, w: 32, h: 78, win: true },
+          { x: 208, w: 24, h: 56, win: false },
+          { x: 234, w: 28, h: 70, win: true },
+          { x: 264, w: 24, h: 50, win: false }
+        ];
+
+        buildings.forEach((b) => {
+          const by = PLAYABLE_HEIGHT - 36 - b.h;
+          ctx.fillStyle = "#B6E3C6";
+          ctx.fillRect(b.x, by, b.w, b.h + 20);
+          ctx.fillStyle = "#9CD4B5";
+          ctx.fillRect(b.x + b.w - 4, by, 4, b.h + 20);
+
+          // Tiny pixel windows
+          if (b.win) {
+            ctx.fillStyle = "#DDF3E4";
+            for (let wy = by + 6; wy < PLAYABLE_HEIGHT - 44; wy += 10) {
+              for (let wx = b.x + 5; wx < b.x + b.w - 8; wx += 7) {
+                ctx.fillRect(wx, wy, 4, 6);
+              }
+            }
+          }
+        });
+
+        // 3. Foreground Green Bush Hedges
+        const bushes = [
+          [10, 366, 24], [34, 360, 28], [62, 368, 22], [88, 358, 30],
+          [120, 366, 25], [148, 360, 28], [178, 368, 24], [206, 358, 30],
+          [238, 364, 26], [268, 360, 28]
+        ];
+        bushes.forEach(([bx, by, br]) => {
+          ctx.fillStyle = "#87E157";
+          ctx.beginPath();
+          ctx.arc(bx, by, br, 0, Math.PI * 2);
+          ctx.fill();
+        });
+        ctx.fillStyle = "#87E157";
+        ctx.fillRect(0, 366, VIRTUAL_WIDTH, 34);
+
+        // Subtle bush top highlight
+        ctx.fillStyle = "#A4EE6F";
+        bushes.forEach(([bx, by, br]) => {
+          ctx.fillRect(bx - 8, by - br + 3, 14, 3);
+        });
+
+        this.sprites.bg = canvas;
+      }
+
+      /**
+       * Bakes a seamless 24px-wide scrolling ground tile with top dark outline,
+       * diagonal light/dark green grass stripes, shadow border, and tan sand base.
+       */
+      bakeGround() {
+        const tileW = 24;
+        const { canvas, ctx } = this.createBuffer(tileW, GROUND_HEIGHT);
+
+        // Base tan sand
+        ctx.fillStyle = PALETTE.SAND;
+        ctx.fillRect(0, 0, tileW, GROUND_HEIGHT);
+
+        // Subtle sand dither texture
+        ctx.fillStyle = PALETTE.SAND_DARK;
+        ctx.fillRect(2, 24, 6, 3);
+        ctx.fillRect(14, 32, 8, 3);
+        ctx.fillRect(6, 48, 10, 3);
+
+        // Top dark pixel border (2px)
+        ctx.fillStyle = PALETTE.OUTLINE;
+        ctx.fillRect(0, 0, tileW, 2);
+
+        // Grass ribbon (14px tall)
+        ctx.fillStyle = PALETTE.GRASS_LIGHT;
+        ctx.fillRect(0, 2, tileW, 14);
+
+        // Diagonal dark green stripes (45-degree pixel steps)
+        ctx.fillStyle = PALETTE.GRASS_DARK;
+        for (let y = 2; y < 16; y++) {
+          const shift = (y - 2);
+          for (let x = -12; x < tileW + 12; x += 12) {
+            ctx.fillRect(x - shift, y, 6, 1);
+          }
+        }
+
+        // Bottom grass shadow & dark divider
+        ctx.fillStyle = "#558022";
+        ctx.fillRect(0, 15, tileW, 2);
+        ctx.fillStyle = PALETTE.OUTLINE;
+        ctx.fillRect(0, 17, tileW, 2);
+        ctx.fillStyle = "#C4BE7A";
+        ctx.fillRect(0, 19, tileW, 2);
+
+        this.sprites.groundTile = canvas;
+      }
+
+      /**
+       * Bakes high-detail cylindrical green pipe body and lip cap with authentic
+       * specular vertical highlights and pixel dithering matching the reference sheet.
+       */
+      bakePipes() {
+        // 1. Pipe Shaft Segment (52px wide x 16px tall, tiled vertically)
+        const shaft = this.createBuffer(PIPE_WIDTH, 16);
+        const sCtx = shaft.ctx;
+
+        sCtx.fillStyle = PALETTE.OUTLINE;
+        sCtx.fillRect(0, 0, PIPE_WIDTH, 16);
+
+        // Gradient bands from left (specular) to right (deep shadow)
+        const bands = [
+          { x: 2, w: 4, c: "#73BF2E" },
+          { x: 6, w: 6, c: "#9CE659" },
+          { x: 12, w: 3, c: "#C7F683" }, // Brightest specular highlight
+          { x: 15, w: 5, c: "#9CE659" },
+          { x: 20, w: 14, c: "#73BF2E" },
+          { x: 34, w: 4, c: "#558022" },
+          { x: 38, w: 2, c: "#73BF2E" }, // Pixel dither strip
+          { x: 40, w: 10, c: "#558022" }
+        ];
+        bands.forEach((b) => {
+          sCtx.fillStyle = b.c;
+          sCtx.fillRect(b.x, 0, b.w, 16);
+        });
+        this.sprites.pipeShaft = shaft.canvas;
+
+        // 2. Pipe Lip Cap (56px wide x 24px tall)
+        const cap = this.createBuffer(PIPE_CAP_WIDTH, PIPE_CAP_HEIGHT);
+        const cCtx = cap.ctx;
+
+        // Outer border
+        cCtx.fillStyle = PALETTE.OUTLINE;
+        cCtx.fillRect(0, 0, PIPE_CAP_WIDTH, PIPE_CAP_HEIGHT);
+
+        const capBands = [
+          { x: 2, w: 4, c: "#73BF2E" },
+          { x: 6, w: 6, c: "#9CE659" },
+          { x: 12, w: 4, c: "#C7F683" },
+          { x: 16, w: 6, c: "#9CE659" },
+          { x: 22, w: 14, c: "#73BF2E" },
+          { x: 36, w: 4, c: "#558022" },
+          { x: 40, w: 2, c: "#73BF2E" },
+          { x: 42, w: 12, c: "#558022" }
+        ];
+        capBands.forEach((b) => {
+          cCtx.fillStyle = b.c;
+          cCtx.fillRect(b.x, 2, b.w, PIPE_CAP_HEIGHT - 4);
+        });
+
+        // Top bevel highlight & bottom lip shadow
+        cCtx.fillStyle = "#C7F683";
+        cCtx.fillRect(2, 2, PIPE_CAP_WIDTH - 4, 2);
+        cCtx.fillStyle = "#558022";
+        cCtx.fillRect(2, PIPE_CAP_HEIGHT - 4, PIPE_CAP_WIDTH - 4, 2);
+
+        this.sprites.pipeCap = cap.canvas;
+      }
+
+      /**
+       * Bakes all 4 authentic Trophy Medals (44x44 virtual px) with embossed
+       * bird silhouette inside each circular coin rim.
+       */
+      bakeMedals() {
+        const tiers = {
+          bronze: { rim: "#8C4A19", base: "#D67E3B", light: "#F2A868", dark: "#A85922" },
+          silver: { rim: "#6E7785", base: "#C4CCD6", light: "#EEF2F7", dark: "#9AA3B0" },
+          gold: { rim: "#9E7816", base: "#F7C839", light: "#FFF08A", dark: "#D49E1E" },
+          platinum: { rim: "#5D8794", base: "#BEE8F2", light: "#FFFFFF", dark: "#8BC3D1" }
+        };
+
+        this.sprites.medals = {};
+        const size = 44;
+        const r = 21;
+        const cx = 22;
+        const cy = 22;
+
+        for (const [name, c] of Object.entries(tiers)) {
+          const { canvas, ctx } = this.createBuffer(size, size);
+
+          // Outer dark rim
+          ctx.fillStyle = c.rim;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Main coin fill
+          ctx.fillStyle = c.base;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r - 2, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Crescent top-left highlight
+          ctx.strokeStyle = c.light;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r - 4, Math.PI * 0.85, Math.PI * 1.75);
+          ctx.stroke();
+
+          // Inner recessed ring
+          ctx.strokeStyle = c.dark;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r - 6, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Embossed Bird Emblem in center
+          ctx.fillStyle = c.light;
+          ctx.fillRect(15, 16, 12, 9);
+          ctx.fillRect(13, 18, 2, 5);
+          ctx.fillRect(27, 19, 5, 4); // Beak
+          ctx.fillStyle = c.dark;
+          ctx.fillRect(16, 25, 11, 2);
+          ctx.fillRect(23, 17, 3, 3); // Eye recess
+
+          this.sprites.medals[name] = canvas;
+        }
+      }
+
+      /**
+       * Bakes the "Get Ready!" translucent ghost bird + pointing pixel hand + red TAP badge.
+       */
+      bakeTapTutorial() {
+        const { canvas, ctx } = this.createBuffer(114, 98);
+
+        // Ghosted bird silhouette at top
+        ctx.globalAlpha = 0.65;
+        ctx.drawImage(this.sprites.birds.yellow[1], 40, 2);
+        ctx.globalAlpha = 1.0;
+
+        // Upward pixel arrow
+        ctx.fillStyle = "#FFFFFF";
+        ctx.strokeStyle = PALETTE.OUTLINE;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(57, 32);
+        ctx.lineTo(64, 40);
+        ctx.lineTo(60, 40);
+        ctx.lineTo(60, 47);
+        ctx.lineTo(54, 47);
+        ctx.lineTo(54, 40);
+        ctx.lineTo(50, 40);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+
+        // Tap burst rays around finger
+        ctx.fillStyle = PALETTE.OUTLINE;
+        ctx.fillRect(56, 51, 2, 5);
+        ctx.fillRect(48, 54, 4, 2);
+        ctx.fillRect(62, 54, 4, 2);
+
+        // Pixel Hand Cursor
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(54, 59, 6, 16);
+        ctx.fillRect(48, 67, 18, 16);
+        ctx.fillRect(45, 71, 4, 8);
+        ctx.strokeStyle = PALETTE.OUTLINE;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(54, 59, 6, 12);
+        ctx.strokeRect(48, 67, 18, 16);
+
+        // Red "TAP" Ribbon Tag on right
+        ctx.fillStyle = PALETTE.RED_BADGE;
+        ctx.beginPath();
+        ctx.moveTo(72, 65);
+        ctx.lineTo(79, 58);
+        ctx.lineTo(110, 58);
+        ctx.lineTo(110, 72);
+        ctx.lineTo(79, 72);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = "#FFFFFF";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.fillStyle = "#FFFFFF";
+        ctx.font = "bold 9px monospace";
+        ctx.fillText("TAP", 83, 68);
+
+        this.sprites.tapTutorial = canvas;
+      }
+    }
+
+    /**
+     * =========================================================================
+     * 4. OBJECT POOLS (ZERO GARBAGE COLLECTION OVERHEAD)
+     * =========================================================================
+     * Pre-allocating fixed-size object pools for Pipe Pairs and Medal Sparkle
+     * Particles eliminates runtime heap allocations (`new`), preventing V8
+     * Garbage Collector micro-stutters during intense gameplay.
+     */
+    class PipePool {
+      constructor(size = 5) {
+        this.pool = Array.from({ length: size }, () => ({
+          active: false,
+          x: 0,
+          topHeight: 0,
+          scored: false
+        }));
+      }
+
+      reset() {
+        for (let i = 0; i < this.pool.length; i++) {
+          this.pool[i].active = false;
+        }
+      }
+
+      spawn(x) {
+        for (let i = 0; i < this.pool.length; i++) {
+          const p = this.pool[i];
+          if (!p.active) {
+            p.active = true;
+            p.x = x;
+            p.topHeight = Math.floor(
+              PIPE_MIN_TOP + Math.random() * (PIPE_MAX_TOP - PIPE_MIN_TOP)
+            );
+            p.scored = false;
+            return p;
+          }
+        }
+        return null;
+      }
+    }
+
+    class SparklePool {
+      constructor(size = 12) {
+        this.pool = Array.from({ length: size }, () => ({
+          active: false,
+          x: 0,
+          y: 0,
+          life: 0,
+          maxLife: 0.45
+        }));
+      }
+
+      reset() {
+        for (let i = 0; i < this.pool.length; i++) {
+          this.pool[i].active = false;
+        }
+      }
+
+      spawn(cx, cy, radius) {
+        for (let i = 0; i < this.pool.length; i++) {
+          const s = this.pool[i];
+          if (!s.active) {
+            const angle = Math.random() * Math.PI * 2;
+            const dist = Math.random() * radius;
+            s.active = true;
+            s.x = cx + Math.cos(angle) * dist;
+            s.y = cy + Math.sin(angle) * dist;
+            s.life = 0;
+            s.maxLife = 0.35 + Math.random() * 0.25;
+            return;
+          }
+        }
+      }
+    }
+
+    /**
+     * =========================================================================
+     * 5. MAIN FLAPPY BIRD GAME ENGINE
+     * =========================================================================
+     */
+    class FlappyBirdGame {
+      constructor() {
+        this.canvas = document.getElementById("gameCanvas");
+        this.ctx = this.canvas.getContext("2d", { alpha: false });
+
+        this.sound = new SoundEngine();
+        this.atlas = new SpriteAtlas();
+        this.pipes = new PipePool(6);
+        this.sparkles = new SparklePool(10);
+
+        // Persistent High Score
+        this.bestScore = parseInt(localStorage.getItem("flappy2013_best") || "0", 10);
+
+        // Core State Machine
+        this.state = STATE.TITLE;
+        this.paused = false;
+        this.score = 0;
+        this.isNewBest = false;
+        this.isNight = false;
+
+        // Bird Kinematics
+        this.birdY = 230;
+        this.birdVy = 0;
+        this.birdRotation = 0; // Radians
+        this.birdVariant = "yellow";
+        this.wingTimer = 0;
+        this.wingFrame = 1;
+        this.hoverPhase = 0;
+
+        // World & Juice Effects
+        this.groundOffset = 0;
+        this.flashAlpha = 0;
+        this.shakeTimer = 0;
+        this.panelY = VIRTUAL_HEIGHT + 40;
+        this.sparkleSpawnTimer = 0;
+        this.displayScore = 0; // Animated score count-up on Game Over board
+
+        // Interactive UI Hit-Rectangles (in 288x512 virtual coordinates)
+        this.uiRects = {
+          titleStart: { x: 28, y: 342, w: 104, h: 36 },
+          titleScore: { x: 156, y: 342, w: 104, h: 36 },
+          pauseBtn: { x: 14, y: 14, w: 26, h: 28 },
+          overOk: { x: 28, y: 348, w: 104, h: 36 },
+          overMenu: { x: 156, y: 348, w: 104, h: 36 }
+        };
+
+        this.handleResize();
+        window.addEventListener("resize", () => this.handleResize());
+        this.bindInputs();
+
+        // Start Fixed/Delta-Time Loop
+        this.lastTime = performance.now();
+        requestAnimationFrame((t) => this.loop(t));
+      }
+
+      /**
+       * Scales the canvas cleanly to fit any desktop/mobile screen while preserving
+       * the exact 288:512 (9:16) aspect ratio and crisp pixel-art rendering.
+       */
+      handleResize() {
+        const winW = window.innerWidth;
+        const winH = window.innerHeight;
+        const targetRatio = VIRTUAL_WIDTH / VIRTUAL_HEIGHT;
+        const winRatio = winW / winH;
+
+        let displayW, displayH;
+        if (winRatio < targetRatio) {
+          displayW = winW;
+          displayH = winW / targetRatio;
+        } else {
+          displayH = winH;
+          displayW = winH * targetRatio;
+        }
+
+        // Set internal pixel resolution & CSS display size
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        this.canvas.width = VIRTUAL_WIDTH * dpr;
+        this.canvas.height = VIRTUAL_HEIGHT * dpr;
+        this.canvas.style.width = `${Math.floor(displayW)}px`;
+        this.canvas.style.height = `${Math.floor(displayH)}px`;
+
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this.ctx.imageSmoothingEnabled = false;
+      }
+
+      /**
+       * Converts screen pointer coordinates to 288x512 virtual canvas space
+       * and handles unified touch, mouse, and keyboard controls.
+       */
+      bindInputs() {
+        const toVirtualPos = (clientX, clientY) => {
+          const rect = this.canvas.getBoundingClientRect();
+          return {
+            x: ((clientX - rect.left) / rect.width) * VIRTUAL_WIDTH,
+            y: ((clientY - rect.top) / rect.height) * VIRTUAL_HEIGHT
+          };
+        };
+
+        const handlePointerDown = (e) => {
+          e.preventDefault();
+          const pt = e.touches ? e.touches[0] : e;
+          const pos = toVirtualPos(pt.clientX, pt.clientY);
+          this.onAction(pos);
+        };
+
+        this.canvas.addEventListener("mousedown", handlePointerDown);
+        this.canvas.addEventListener("touchstart", handlePointerDown, { passive: false });
+
+        window.addEventListener("keydown", (e) => {
+          if (e.repeat) return;
+          if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") {
+            e.preventDefault();
+            this.onAction(null);
+          } else if (e.code === "KeyP" || e.code === "Escape") {
+            if (this.state === STATE.PLAYING) {
+              this.paused = !this.paused;
+              this.sound.playSwoosh();
+            }
+          }
+        });
+      }
+
+      pointInRect(pt, r) {
+        if (!pt) return false;
+        return pt.x >= r.x && pt.x <= r.x + r.w && pt.y >= r.y && pt.y <= r.y + r.h;
+      }
+
+      /**
+       * Central Input Dispatcher across all 5 Game States
+       */
+      onAction(pt) {
+        this.sound.init();
+
+        // 1. TITLE SCREEN
+        if (this.state === STATE.TITLE) {
+          if (!pt || this.pointInRect(pt, this.uiRects.titleStart)) {
+            this.sound.playSwoosh();
+            this.enterReadyState();
+          } else if (this.pointInRect(pt, this.uiRects.titleScore)) {
+            // Quick toggle Day/Night atmosphere or show high score feedback
+            this.isNight = !this.isNight;
+            this.sound.playScore();
+          }
+          return;
+        }
+
+        // 2. GET READY SCREEN -> First Tap launches the bird!
+        if (this.state === STATE.READY) {
+          this.state = STATE.PLAYING;
+          this.flap();
+          return;
+        }
+
+        // 3. ACTIVE GAMEPLAY
+        if (this.state === STATE.PLAYING) {
+          // Check top-left Pause/Resume Button
+          if (pt && this.pointInRect(pt, this.uiRects.pauseBtn)) {
+            this.paused = !this.paused;
+            this.sound.playSwoosh();
+            return;
+          }
+          if (this.paused) {
+            this.paused = false;
+            this.sound.playSwoosh();
+            return;
+          }
+          this.flap();
+          return;
+        }
+
+        // 4. GAME OVER SCOREBOARD
+        if (this.state === STATE.GAME_OVER && this.panelY <= 178) {
+          if (!pt || this.pointInRect(pt, this.uiRects.overOk)) {
+            this.sound.playSwoosh();
+            this.enterReadyState();
+          } else if (this.pointInRect(pt, this.uiRects.overMenu)) {
+            this.sound.playSwoosh();
+            this.enterTitleState();
+          }
+        }
+      }
+
+      enterTitleState() {
+        this.state = STATE.TITLE;
+        this.paused = false;
+        this.pipes.reset();
+        this.sparkles.reset();
+        this.birdY = 230;
+        this.birdRotation = 0;
+        this.pickRandomBirdColor();
+      }
+
+      enterReadyState() {
+        this.state = STATE.READY;
+        this.paused = false;
+        this.score = 0;
+        this.displayScore = 0;
+        this.isNewBest = false;
+        this.pipes.reset();
+        this.sparkles.reset();
+        this.birdY = 225;
+        this.birdVy = 0;
+        this.birdRotation = 0;
+        this.pickRandomBirdColor();
+      }
+
+      pickRandomBirdColor() {
+        const colors = ["yellow", "red", "blue"];
+        this.birdVariant = colors[Math.floor(Math.random() * colors.length)];
+        // Original 2013 Flappy Bird had ~25% chance to load the Night background
+        this.isNight = Math.random() < 0.25;
+      }
+
+      flap() {
+        this.birdVy = FLAP_IMPULSE;
+        this.wingFrame = 0;
+        this.wingTimer = 0;
+        this.sound.playFlap();
+      }
+
+      /**
+       * =====================================================================
+       * 6. FIXED/DELTA-TIME PHYSICS & AABB COLLISION DETECTION
+       * =====================================================================
+       * Why AABB (Axis-Aligned Bounding Box) with a Forgiving Inset?
+       * Although the bird sprite rotates visually, using a tight, non-rotated
+       * inner bounding box (24x18 inside the 34x24 sprite) prevents frustrating
+       * "phantom beak-tip deaths" and matches the authentic feel of the original.
+       */
+      update(dt) {
+        if (this.paused) return;
+
+        // Screen flash decay
+        if (this.flashAlpha > 0) {
+          this.flashAlpha = Math.max(0, this.flashAlpha - dt * 3.8);
+        }
+
+        // Camera impact micro-shake decay
+        if (this.shakeTimer > 0) {
+          this.shakeTimer = Math.max(0, this.shakeTimer - dt);
+        }
+
+        // Wing flap cycle animation
+        const flapSpeed = this.state === STATE.PLAYING && this.birdVy > 220 ? 0 : 14;
+        if (flapSpeed > 0) {
+          this.wingTimer += dt * flapSpeed;
+          const cycle = [0, 1, 2, 1];
+          this.wingFrame = cycle[Math.floor(this.wingTimer) % 4];
+        } else {
+          this.wingFrame = 1; // Wings lock level during steep dive
+        }
+
+        // Scroll ground & spawn pipes during TITLE, READY, and PLAYING
+        if (this.state === STATE.TITLE || this.state === STATE.READY || this.state === STATE.PLAYING) {
+          this.groundOffset = (this.groundOffset + SCROLL_SPEED * dt) % 24;
+        }
+
+        // Hover sine-wave motion on Title & Get Ready screens
+        if (this.state === STATE.TITLE || this.state === STATE.READY) {
+          this.hoverPhase += dt * 5.2;
+          const baseY = this.state === STATE.TITLE ? 228 : 224;
+          this.birdY = baseY + Math.sin(this.hoverPhase) * 5;
+          this.birdRotation = 0;
+          return;
+        }
+
+        // Active Gameplay Kinematics
+        if (this.state === STATE.PLAYING) {
+          this.birdVy = Math.min(MAX_FALL_SPEED, this.birdVy + GRAVITY * dt);
+          this.birdY += this.birdVy * dt;
+
+          // Ceiling clamp (original prevents flying over pipes off-screen)
+          if (this.birdY < 12) {
+            this.birdY = 12;
+            this.birdVy = 0;
+          }
+
+          // Authentic 2013 pitch curve: snaps to -25 deg on flap, holds level,
+          // then nose-dives smoothly down to +90 deg when falling fast.
+          if (this.birdVy < 110) {
+            this.birdRotation = -25 * (Math.PI / 180);
+          } else {
+            const fallRatio = Math.min(1, (this.birdVy - 110) / (MAX_FALL_SPEED - 110));
+            this.birdRotation = (-25 + fallRatio * 115) * (Math.PI / 180);
+          }
+
+          // Manage Pipe Spawning & Movement
+          let rightmostX = 0;
+          let activeCount = 0;
+          for (let i = 0; i < this.pipes.pool.length; i++) {
+            const p = this.pipes.pool[i];
+            if (!p.active) continue;
+            activeCount++;
+            p.x -= SCROLL_SPEED * dt;
+
+            if (p.x > rightmostX) rightmostX = p.x;
+
+            // Score trigger when bird center passes pipe center
+            const pipeCenter = p.x + PIPE_WIDTH * 0.5;
+            if (!p.scored && pipeCenter < BIRD_X) {
+              p.scored = true;
+              this.score++;
+              this.sound.playScore();
+            }
+
+            // Recycle off-screen pipes back into the pool
+            if (p.x + PIPE_CAP_WIDTH < -10) {
+              p.active = false;
+            }
+          }
+
+          if (activeCount === 0) {
+            this.pipes.spawn(VIRTUAL_WIDTH + 90);
+          } else if (rightmostX < VIRTUAL_WIDTH - PIPE_SPACING + PIPE_WIDTH) {
+            this.pipes.spawn(rightmostX + PIPE_SPACING);
+          }
+
+          // AABB Collision Check: Ground & Pipes
+          if (this.checkCollisions()) {
+            this.triggerCrash();
+          }
+        } else if (this.state === STATE.DYING) {
+          // Bird tumbles straight down to the ground after hitting a pipe
+          this.birdVy = Math.min(MAX_FALL_SPEED * 1.25, this.birdVy + GRAVITY * 1.2 * dt);
+          this.birdY += this.birdVy * dt;
+          this.birdRotation = Math.min(Math.PI * 0.5, this.birdRotation + 7.5 * dt);
+
+          if (this.birdY + BIRD_HITBOX_H * 0.5 >= PLAYABLE_HEIGHT) {
+            this.birdY = PLAYABLE_HEIGHT - BIRD_HITBOX_H * 0.5;
+            this.enterGameOver();
+          }
+        } else if (this.state === STATE.GAME_OVER) {
+          // Slide scoreboard panel smoothly up into position
+          if (this.panelY > 174) {
+            this.panelY = Math.max(174, this.panelY - 980 * dt);
+          } else {
+            // Animate score counter tick-up
+            if (this.displayScore < this.score) {
+              this.displayScore = Math.min(this.score, this.displayScore + Math.ceil(this.score * dt * 3));
+            }
+            // Spawn shimmering pixel sparkles over earned medals (10+)
+            if (this.score >= 10) {
+              this.sparkleSpawnTimer += dt;
+              if (this.sparkleSpawnTimer >= 0.16) {
+                this.sparkleSpawnTimer = 0;
+                this.sparkles.spawn(75, this.panelY + 64, 19);
+              }
+            }
+          }
+
+          // Update active sparkles
+          for (let i = 0; i < this.sparkles.pool.length; i++) {
+            const s = this.sparkles.pool[i];
+            if (s.active) {
+              s.life += dt;
+              if (s.life >= s.maxLife) s.active = false;
+            }
+          }
+        }
+      }
+
+      checkCollisions() {
+        const bx = BIRD_X - BIRD_HITBOX_W * 0.5;
+        const by = this.birdY - BIRD_HITBOX_H * 0.5;
+
+        // 1. Ground collision
+        if (by + BIRD_HITBOX_H >= PLAYABLE_HEIGHT) {
+          this.birdY = PLAYABLE_HEIGHT - BIRD_HITBOX_H * 0.5;
+          return true;
+        }
+
+        // 2. Pipe AABB intersection
+        for (let i = 0; i < this.pipes.pool.length; i++) {
+          const p = this.pipes.pool[i];
+          if (!p.active) continue;
+
+          const px = p.x;
+          const pw = PIPE_WIDTH;
+          const bottomPipeY = p.topHeight + PIPE_GAP;
+
+          // Horizontal overlap test
+          if (bx + BIRD_HITBOX_W > px && bx < px + pw) {
+            // Vertical overlap test (above gap OR below gap)
+            if (by < p.topHeight || by + BIRD_HITBOX_H > bottomPipeY) {
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+
+      triggerCrash() {
+        this.flashAlpha = 0.85;
+        this.shakeTimer = 0.22;
+        this.sound.playHit();
+
+        // Check if bird hit ground directly vs hit a pipe mid-air
+        if (this.birdY + BIRD_HITBOX_H * 0.5 >= PLAYABLE_HEIGHT - 1) {
+          this.enterGameOver();
+        } else {
+          this.state = STATE.DYING;
+          this.birdVy = -140; // Slight upward knockback before tumble
+          this.sound.playDie();
+        }
+      }
+
+      enterGameOver() {
+        this.state = STATE.GAME_OVER;
+        this.panelY = VIRTUAL_HEIGHT + 20;
+        this.displayScore = 0;
+
+        if (this.score > this.bestScore) {
+          this.bestScore = this.score;
+          this.isNewBest = true;
+          localStorage.setItem("flappy2013_best", String(this.bestScore));
+        }
+      }
+
+      /**
+       * =====================================================================
+       * 7. LAYERED PIXEL-ART RENDER PIPELINE
+       * =====================================================================
+       * Renders back-to-front in strict painter's order:
+       * Sky -> City/Bushes -> Pipes -> Ground -> Bird -> HUD/UI -> Flash
+       */
+      render() {
+        const ctx = this.ctx;
+        ctx.save();
+
+        // Micro-screen shake on collision
+        if (this.shakeTimer > 0) {
+          const mag = Math.ceil(this.shakeTimer * 18);
+          const ox = (Math.random() - 0.5) * mag * 2;
+          const oy = (Math.random() - 0.5) * mag * 2;
+          ctx.translate(Math.round(ox), Math.round(oy));
+        }
+
+        // Layer 1: Sky Fill (Day #70C5CE or Night #008793)
+        ctx.fillStyle = this.isNight ? PALETTE.SKY_NIGHT : PALETTE.SKY_DAY;
+        ctx.fillRect(0, 0, VIRTUAL_WIDTH, PLAYABLE_HEIGHT);
+
+        // Layer 2: Pre-baked Clouds, City Skyline & Bushes
+        if (this.isNight) {
+          ctx.globalAlpha = 0.72;
+        }
+        ctx.drawImage(this.atlas.sprites.bg, 0, 0);
+        ctx.globalAlpha = 1.0;
+
+        // Layer 3: Pooled Pipe Pairs
+        this.renderPipes(ctx);
+
+        // Layer 4: Scrolling Ground Ribbon
+        const gx = -Math.floor(this.groundOffset);
+        for (let x = gx; x < VIRTUAL_WIDTH + 24; x += 24) {
+          ctx.drawImage(this.atlas.sprites.groundTile, x, PLAYABLE_HEIGHT);
+        }
+
+        // Layer 5: Rotated Bird Sprite (hidden on Title screen since logo has its own bird)
+        if (this.state !== STATE.TITLE) {
+          this.renderBird(ctx);
+        }
+
+        // Layer 6: State-Specific Pixel UI & Trophy Board
+        this.renderUI(ctx);
+
+        // Layer 7: White Collision Impact Flash
+        if (this.flashAlpha > 0) {
+          ctx.fillStyle = `rgba(255, 255, 255, ${this.flashAlpha})`;
+          ctx.fillRect(0, 0, VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
+        }
+
+        ctx.restore();
+      }
+
+      renderPipes(ctx) {
+        const shaft = this.atlas.sprites.pipeShaft;
+        const cap = this.atlas.sprites.pipeCap;
+
+        for (let i = 0; i < this.pipes.pool.length; i++) {
+          const p = this.pipes.pool[i];
+          if (!p.active) continue;
+
+          const px = Math.round(p.x);
+          const capX = px - (PIPE_CAP_WIDTH - PIPE_WIDTH) * 0.5;
+
+          // TOP PIPE (hangs down from y = 0 to p.topHeight)
+          const topShaftH = Math.max(0, p.topHeight - PIPE_CAP_HEIGHT);
+          if (topShaftH > 0) {
+            ctx.drawImage(shaft, 0, 0, PIPE_WIDTH, 16, px, 0, PIPE_WIDTH, topShaftH);
+          }
+          ctx.drawImage(cap, capX, p.topHeight - PIPE_CAP_HEIGHT);
+
+          // BOTTOM PIPE (rises from bottomY to PLAYABLE_HEIGHT)
+          const bottomY = p.topHeight + PIPE_GAP;
+          const bottomShaftY = bottomY + PIPE_CAP_HEIGHT;
+          const bottomShaftH = Math.max(0, PLAYABLE_HEIGHT - bottomShaftY);
+          if (bottomShaftH > 0) {
+            ctx.drawImage(
+              shaft,
+              0,
+              0,
+              PIPE_WIDTH,
+              16,
+              px,
+              bottomShaftY,
+              PIPE_WIDTH,
+              bottomShaftH
+            );
+          }
+          ctx.drawImage(cap, capX, bottomY);
+        }
+      }
+
+      renderBird(ctx) {
+        const sprite = this.atlas.sprites.birds[this.birdVariant][this.wingFrame];
+        ctx.save();
+        ctx.translate(Math.round(BIRD_X), Math.round(this.birdY));
+        ctx.rotate(this.birdRotation);
+        ctx.drawImage(
+          sprite,
+          -Math.floor(BIRD_SPRITE_W * 0.5),
+          -Math.floor(BIRD_SPRITE_H * 0.5)
+        );
+        ctx.restore();
+      }
+
+      /**
+       * Renders crisp outlined pixel typography, tactile beveled buttons,
+       * the Get Ready tutorial overlay, and the Game Over Trophy Panel.
+       */
+      drawOutlinedText(ctx, text, x, y, size, fill, align = "center", shadowOffset = 2) {
+        ctx.font = `900 ${size}px "Courier New", monospace`;
+        ctx.textAlign = align;
+        ctx.textBaseline = "middle";
+
+        // Drop shadow
+        ctx.fillStyle = PALETTE.OUTLINE;
+        ctx.fillText(text, x + shadowOffset, y + shadowOffset);
+
+        // 8-direction crisp pixel stroke
+        for (let ox = -2; ox <= 2; ox++) {
+          for (let oy = -2; oy <= 2; oy++) {
+            if (ox !== 0 || oy !== 0) {
+              ctx.fillText(text, x + ox, y + oy);
+            }
+          }
+        }
+
+        ctx.fillStyle = fill;
+        ctx.fillText(text, x, y);
+      }
+
+      drawTactileButton(ctx, rect, label, bgColor = PALETTE.BTN_CREAM, textColor = PALETTE.BTN_ORANGE) {
+        const { x, y, w, h } = rect;
+        // Dark outer pixel frame + bottom drop shadow
+        ctx.fillStyle = PALETTE.OUTLINE;
+        ctx.fillRect(x, y + 2, w, h);
+        ctx.fillRect(x, y, w, h);
+
+        // Inner button face
+        ctx.fillStyle = bgColor;
+        ctx.fillRect(x + 2, y + 2, w - 4, h - 4);
+
+        // Top white bevel highlight
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(x + 2, y + 2, w - 4, 2);
+
+        // Bottom inner shadow
+        ctx.fillStyle = "#C8C2A8";
+        ctx.fillRect(x + 2, y + h - 4, w - 4, 2);
+
+        // Label
+        ctx.font = '900 13px "Courier New", monospace';
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = textColor;
+        ctx.fillText(label, x + w * 0.5, y + h * 0.5 + 1);
+      }
+
+      renderUI(ctx) {
+        // 1. TITLE SCREEN UI
+        if (this.state === STATE.TITLE) {
+          // Iconic "Flappy Bird" Logo Banner
+          this.drawOutlinedText(ctx, "Flappy Bird", 124, 152, 26, "#FFFFFF", "center", 3);
+
+          // Animated Hovering Bird next to logo (matching reference image_c60027.png)
+          const logoBird = this.atlas.sprites.birds[this.birdVariant][this.wingFrame];
+          ctx.drawImage(logoBird, 232, Math.round(this.birdY - 88));
+
+          // Tactile "START" and "THEME" (SCORE/DAY-NIGHT) Buttons
+          this.drawTactileButton(ctx, this.uiRects.titleStart, "START");
+          this.drawTactileButton(ctx, this.uiRects.titleScore, this.isNight ? "DAY" : "NIGHT");
+
+          // Authentic Footer Credit
+          ctx.font = 'bold 10px "Courier New", monospace';
+          ctx.textAlign = "center";
+          ctx.fillStyle = PALETTE.OUTLINE;
+          ctx.fillText("© GEARS Studios 2013 Replica", VIRTUAL_WIDTH * 0.5, 434);
+          return;
+        }
+
+        // 2. GET READY SCREEN UI
+        if (this.state === STATE.READY) {
+          this.drawOutlinedText(ctx, String(this.score), VIRTUAL_WIDTH * 0.5, 58, 34, "#FFFFFF", "center", 3);
+          this.drawOutlinedText(ctx, "Get Ready!", VIRTUAL_WIDTH * 0.5, 146, 26, "#9CE659", "center", 3);
+          ctx.drawImage(this.atlas.sprites.tapTutorial, 87, 212);
+          return;
+        }
+
+        // 3. ACTIVE GAMEPLAY & DYING HUD
+        if (this.state === STATE.PLAYING || this.state === STATE.DYING) {
+          // Large Top-Center Score Counter
+          this.drawOutlinedText(ctx, String(this.score), VIRTUAL_WIDTH * 0.5, 58, 34, "#FFFFFF", "center", 3);
+
+          // Top-Left Pause / Play Button (matching reference image_c60027.png)
+          const p = this.uiRects.pauseBtn;
+          ctx.fillStyle = PALETTE.OUTLINE;
+          ctx.fillRect(p.x, p.y, p.w, p.h);
+          ctx.fillStyle = "#E89B48";
+          ctx.fillRect(p.x + 2, p.y + 2, p.w - 4, p.h - 4);
+          ctx.fillStyle = "#FFFFFF";
+          if (this.paused) {
+            // Play triangle icon
+            ctx.beginPath();
+            ctx.moveTo(p.x + 9, p.y + 7);
+            ctx.lineTo(p.x + 19, p.y + 14);
+            ctx.lineTo(p.x + 9, p.y + 21);
+            ctx.closePath();
+            ctx.fill();
+          } else {
+            // Two pause bars
+            ctx.fillRect(p.x + 8, p.y + 7, 3, 14);
+            ctx.fillRect(p.x + 15, p.y + 7, 3, 14);
+          }
+
+          if (this.paused) {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+            ctx.fillRect(0, 0, VIRTUAL_WIDTH, VIRTUAL_HEIGHT);
+            this.drawOutlinedText(ctx, "PAUSED", VIRTUAL_WIDTH * 0.5, 220, 26, "#FFFFFF", "center", 3);
+          }
+          return;
+        }
+
+        // 4. GAME OVER SCOREBOARD & 4-TIER MEDAL TROPHY SYSTEM
+        if (this.state === STATE.GAME_OVER) {
+          // "Game Over" Orange Pixel Banner
+          this.drawOutlinedText(ctx, "Game Over", VIRTUAL_WIDTH * 0.5, 118, 28, "#F89828", "center", 3);
+
+          // Tan Parchment Scoreboard Panel (226x114 virtual px)
+          const px = 31;
+          const py = Math.round(this.panelY);
+          const pw = 226;
+          const ph = 114;
+
+          ctx.fillStyle = PALETTE.OUTLINE;
+          ctx.fillRect(px, py, pw, ph);
+          ctx.fillStyle = PALETTE.SAND;
+          ctx.fillRect(px + 2, py + 2, pw - 4, ph - 4);
+
+          // Panel inner bevel borders
+          ctx.fillStyle = "#EAE5A8";
+          ctx.fillRect(px + 2, py + 2, pw - 4, 3);
+          ctx.fillStyle = "#C4BE7A";
+          ctx.fillRect(px + 2, py + ph - 5, pw - 4, 3);
+
+          // Panel Headers: MEDAL, SCORE, BEST
+          ctx.font = '900 11px "Courier New", monospace';
+          ctx.fillStyle = "#D47838";
+          ctx.textAlign = "left";
+          ctx.fillText("MEDAL", px + 26, py + 24);
+          ctx.textAlign = "right";
+          ctx.fillText("SCORE", px + pw - 22, py + 24);
+          ctx.fillText("BEST", px + pw - 22, py + 72);
+
+          // Medal Recessed Slot
+          const medalX = px + 22;
+          const medalY = py + 42;
+          ctx.fillStyle = "#C9C382";
+          ctx.beginPath();
+          ctx.arc(medalX + 22, medalY + 22, 21, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Render Earned Trophy Medal (10 Bronze, 20 Silver, 30 Gold, 40+ Platinum)
+          let medalKey = null;
+          if (this.score >= 40) medalKey = "platinum";
+          else if (this.score >= 30) medalKey = "gold";
+          else if (this.score >= 20) medalKey = "silver";
+          else if (this.score >= 10) medalKey = "bronze";
+
+          if (medalKey) {
+            ctx.drawImage(this.atlas.sprites.medals[medalKey], medalX, medalY);
+          }
+
+          // Shimmering Pixel Sparkles over Medal
+          for (let i = 0; i < this.sparkles.pool.length; i++) {
+            const s = this.sparkles.pool[i];
+            if (!s.active) continue;
+            const prog = s.life / s.maxLife;
+            const r = Math.sin(prog * Math.PI) * 4;
+            const sx = Math.round(s.x);
+            const sy = Math.round(s.y);
+            ctx.fillStyle = "#FFFFFF";
+            ctx.fillRect(sx - r, sy, r * 2 + 1, 1);
+            ctx.fillRect(sx, sy - r, 1, r * 2 + 1);
+          }
+
+          // Current Score & Best Score Numbers
+          this.drawOutlinedText(ctx, String(this.displayScore), px + pw - 22, py + 44, 20, "#FFFFFF", "right", 2);
+          this.drawOutlinedText(ctx, String(this.bestScore), px + pw - 22, py + 92, 20, "#FFFFFF", "right", 2);
+
+          // Red "NEW" High-Score Badge
+          if (this.isNewBest) {
+            ctx.fillStyle = PALETTE.RED_BADGE;
+            ctx.fillRect(px + pw - 78, py + 64, 26, 13);
+            ctx.font = 'bold 9px "Courier New", monospace';
+            ctx.fillStyle = "#FFFFFF";
+            ctx.textAlign = "center";
+            ctx.fillText("NEW", px + pw - 65, py + 71);
+          }
+
+          // Bottom Action Buttons ("OK" to replay, "MENU" to return to title)
+          if (this.panelY <= 178) {
+            this.drawTactileButton(ctx, this.uiRects.overOk, "OK");
+            this.drawTactileButton(ctx, this.uiRects.overMenu, "MENU");
+          }
+        }
+      }
+
+      /**
+       * Main `requestAnimationFrame` Game Loop with Clamped Delta Time (`dt`).
+       * Clamping `dt` to 0.05s (50ms) prevents the bird from tunneling through
+       * pipes if the user switches browser tabs and returns later.
+       */
+      loop(now) {
+        const rawDt = (now - this.lastTime) / 1000;
+        this.lastTime = now;
+        const dt = Math.min(rawDt, 0.05);
+
+        this.update(dt);
+        this.render();
+
+        requestAnimationFrame((t) => this.loop(t));
+      }
+    }
+
+    // Boot engine once DOM is ready
+    window.addEventListener("load", () => {
+      window.flappyGame = new FlappyBirdGame();
+    });
+  </script>
+</body>
+</html>
